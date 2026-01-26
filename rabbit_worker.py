@@ -7,7 +7,7 @@ import pika
 from storage import init_db, insert_raw_result
 from session_repo import SessionRepository
 from aggregates_sessions import compute_session_aggregates
-from report_pdf import generate_pdf_for_sessions  # PDF dla listy sesji / None
+from report_pdf import generate_pdf_for_sessions
 
 
 # ====== Rabbit config ======
@@ -16,76 +16,88 @@ RABBIT_PORT = int(os.getenv("RABBIT_PORT", "5672"))
 RABBIT_USER = os.getenv("RABBIT_USER", "guest")
 RABBIT_PASS = os.getenv("RABBIT_PASS", "guest")
 
-# START (summary)
 SUMMARY_EXCHANGE = os.getenv("SUMMARY_EXCHANGE", "summary_exchange")
+
 SUMMARY_QUEUE = os.getenv("SUMMARY_QUEUE", "summary_queue")
 SUMMARY_KEY = os.getenv("SUMMARY_KEY", "analysis_start")
 
-# RAW jobs queue (to jest kolejka z jobami!)
+DONE_QUEUE = os.getenv("DONE_QUEUE", "summary_done_queue")
+DONE_KEY = os.getenv("DONE_KEY", "analysis_done")
+
 RAW_QUEUE = os.getenv("RAW_QUEUE", "perf.raw")
 
-# Reply (done)
-DONE_KEY = os.getenv("DONE_KEY", "analysis_done")  # backend powinien zbindować
 
 # ====== DB / report config ======
 DB_PATH = os.getenv("REPORT_DB", "data/perf.db")
 SCHEMA_PATH = os.getenv("REPORT_SCHEMA", "schema.sql")
 BUCKET_SECONDS = int(os.getenv("BUCKET_SECONDS", "10"))
-TIMEOUT_SECONDS = float(os.getenv("ANALYSIS_TIMEOUT_SECONDS", "2.0"))
+TIMEOUT_SECONDS = float(os.getenv("ANALYSIS_TIMEOUT_SECONDS", "5.0"))
 
 REPORTS_DIR = os.getenv("REPORTS_DIR", "reports")
 os.makedirs(REPORTS_DIR, exist_ok=True)
 
 
+# ================= Rabbit helpers =================
+
 def publish_done(ch, payload: dict):
     ch.basic_publish(
         exchange=SUMMARY_EXCHANGE,
         routing_key=DONE_KEY,
-        body=json.dumps(payload).encode("utf-8"),
-        properties=pika.BasicProperties(delivery_mode=2),
+        body=json.dumps(payload).encode(),
+        properties=pika.BasicProperties(
+            delivery_mode=2,           # trwała wiadomość
+            content_type="application/json",
+            priority=0                 # opcjonalne, jeśli Twoja kolejka obsługuje priorytety
+        )
     )
+    print("[DONE] published")
+
 
 
 def decode_raw_to_list(body: bytes) -> list[dict]:
-    msg = json.loads(body.decode("utf-8"))
+    msg = json.loads(body.decode())
     return msg if isinstance(msg, list) else [msg]
 
 
+# ================= START =================
+
 def wait_for_analysis_start(ch) -> tuple[str, int]:
-    """
-    Blokuje dopóki nie przyjdzie analysis_start.
-    Oczekuje JSON: {"description":"...", "totalDepth":3}
-    """
+    print("[*] Waiting for analysis_start...")
     while True:
         method, props, body = ch.basic_get(queue=SUMMARY_QUEUE, auto_ack=False)
-        if method is None:
-            time.sleep(0.05)
+        if not method:
+            time.sleep(0.2)
             continue
 
         try:
-            msg = json.loads(body.decode("utf-8"))
+            msg = json.loads(body.decode())
             desc = str(msg.get("description", ""))
             total_depth = int(msg["totalDepth"])
             ch.basic_ack(method.delivery_tag)
             return desc, total_depth
         except Exception as e:
-            print(f"[START] bad message: {e}")
+            print("[START] invalid:", e)
             ch.basic_nack(method.delivery_tag, requeue=False)
 
 
-def finalize_session(ch, description: str, total_depth: int, jobs_depth: dict[int, int]):
-    """
-    1) zapis sesji + mapping jobów
-    2) agregaty sesji
-    3) PDF sesji
-    4) reply z PDF (base64)
-    """
+# ================= RAW drain =================
+
+def drain_raw_queue(ch):
+    while True:
+        method, _, _ = ch.basic_get(queue=RAW_QUEUE, auto_ack=True)
+        if not method:
+            return
+
+
+# ================= SESSION =================
+
+def finalize_session(ch, description, total_depth, jobs_depth):
     if not jobs_depth:
         publish_done(ch, {
             "event": "analysis_done",
             "ok": False,
             "description": description,
-            "error": "Timeout/finish but no jobs received.",
+            "error": "No RAW data received"
         })
         return
 
@@ -95,21 +107,16 @@ def finalize_session(ch, description: str, total_depth: int, jobs_depth: dict[in
         total_depth=total_depth,
         jobs_depth=jobs_depth,
         status="DONE",
-        started_at=None,
+        started_at=None
     )
 
     compute_session_aggregates(DB_PATH, session_ids=session_id, bucket_seconds=BUCKET_SECONDS)
 
     out_pdf = os.path.join(REPORTS_DIR, f"raport_session_{session_id}.pdf")
-    generate_pdf_for_sessions(
-        db_path=DB_PATH,
-        session_ids=session_id,
-        out_path=out_pdf,
-        bucket_seconds=BUCKET_SECONDS,
-    )
+    generate_pdf_for_sessions(DB_PATH, session_id, out_pdf, BUCKET_SECONDS)
 
     with open(out_pdf, "rb") as f:
-        pdf_bytes = f.read()
+        pdf = f.read()
 
     publish_done(ch, {
         "event": "analysis_done",
@@ -119,94 +126,93 @@ def finalize_session(ch, description: str, total_depth: int, jobs_depth: dict[in
         "jobs_count": len(jobs_depth),
         "totalDepth": total_depth,
         "pdf_filename": os.path.basename(out_pdf),
-        "pdf_size_bytes": len(pdf_bytes),
-        "pdf_b64": base64.b64encode(pdf_bytes).decode("ascii"),
+        "pdf_size_bytes": len(pdf),
+        "pdf_b64": base64.b64encode(pdf).decode()
     })
 
 
-def consume_raw_for_one_session(ch, description: str, total_depth: int):
-    """
-    Zaczyna konsumować RAW dopiero po analysis_start.
-    Kończy gdy:
-      - 2 sek bez wiadomości RAW => timeout
-      - wszyscy joby w mapie mają depth == totalDepth
-    """
-    jobs_depth: dict[int, int] = {}
-    last_msg_ts = time.monotonic()
+def consume_raw_for_one_session(ch, description, total_depth):
+    jobs_depth = {}
+    last_msg = time.monotonic()
 
-    def complete_by_depth() -> bool:
-        return bool(jobs_depth) and all(d >= total_depth for d in jobs_depth.values())
+    print("[RAW] collecting...")
 
-    # consume z inactivity_timeout: iteruje wiadomości; jak brak przez TIMEOUT_SECONDS -> yield (None,None,None)
-    for method, props, body in ch.consume(queue=RAW_QUEUE, auto_ack=False, inactivity_timeout=TIMEOUT_SECONDS):
-        if method is None:
-            # timeout: nie przyszło nic przez TIMEOUT_SECONDS
-            finalize_session(ch, description, total_depth, jobs_depth)
-            # ważne: kończymy konsumpcję RAW dla tej sesji
-            break
+    while True:
+        method, props, body = ch.basic_get(queue=RAW_QUEUE, auto_ack=False)
+
+        now = time.monotonic()
+
+        # inactivity timeout
+        if not method:
+            if now - last_msg > TIMEOUT_SECONDS:
+                print("[RAW] timeout")
+                finalize_session(ch, description, total_depth, jobs_depth)
+                drain_raw_queue(ch)
+                return
+            time.sleep(0.2)
+            continue
 
         try:
             dtos = decode_raw_to_list(body)
 
-            # zapis RAW do DB
             for dto in dtos:
                 insert_raw_result(DB_PATH, dto)
 
-            # depth liczymy jako "jedna wiadomość" per job_id obecny w tej wiadomości
-            job_ids = {int(dto["job_id"]) for dto in dtos}
-            for jid in job_ids:
+            for jid in {int(x["job_id"]) for x in dtos}:
                 jobs_depth[jid] = jobs_depth.get(jid, 0) + 1
 
-            last_msg_ts = time.monotonic()
             ch.basic_ack(method.delivery_tag)
+            last_msg = now
 
-            if complete_by_depth():
+            print(f"[RAW] jobs={jobs_depth}")
+
+            if jobs_depth and all(v >= total_depth for v in jobs_depth.values()):
+                print("[RAW] depth complete")
                 finalize_session(ch, description, total_depth, jobs_depth)
-                break
+                drain_raw_queue(ch)
+                return
 
         except Exception as e:
-            print(f"[RAW] bad message: {e}")
+            print("[RAW] bad msg:", e)
             ch.basic_nack(method.delivery_tag, requeue=False)
 
-    # PRZERWIJ generator consume (czyści stan po stronie pika)
-    try:
-        ch.cancel()
-    except Exception:
-        pass
 
+# ================= main =================
 
 def main():
     init_db(DB_PATH, SCHEMA_PATH)
 
     creds = pika.PlainCredentials(RABBIT_USER, RABBIT_PASS)
     conn = pika.BlockingConnection(
-        pika.ConnectionParameters(host=RABBIT_HOST, port=RABBIT_PORT, credentials=creds, heartbeat=60)
+        pika.ConnectionParameters(RABBIT_HOST, RABBIT_PORT, credentials=creds, heartbeat=60)
     )
     ch = conn.channel()
     ch.basic_qos(prefetch_count=1)
+    ch.confirm_delivery()   # publisher confirms
 
-    # declare / bind START
+    # exchange
     ch.exchange_declare(exchange=SUMMARY_EXCHANGE, exchange_type="direct", durable=True)
+
+    # START queue
     ch.queue_declare(queue=SUMMARY_QUEUE, durable=True)
     ch.queue_bind(queue=SUMMARY_QUEUE, exchange=SUMMARY_EXCHANGE, routing_key=SUMMARY_KEY)
 
-    # declare RAW (ale UWAGA: nie konsumujemy dopóki nie ma startu)
+    # DONE queue
+    ch.queue_declare(queue=DONE_QUEUE, durable=True)
+    ch.queue_bind(queue=DONE_QUEUE, exchange=SUMMARY_EXCHANGE, routing_key=DONE_KEY)
+    print(f"[INFO] DONE queue '{DONE_QUEUE}' bound to {SUMMARY_EXCHANGE}:{DONE_KEY}")
+
+    # RAW queue
     ch.queue_declare(queue=RAW_QUEUE, durable=True)
 
-    print(f"[*] Waiting for analysis_start on {SUMMARY_EXCHANGE}:{SUMMARY_KEY} (queue={SUMMARY_QUEUE})")
-    print(f"[*] RAW queue (will be consumed ONLY after start): {RAW_QUEUE}")
-    print(f"[*] Timeout: {TIMEOUT_SECONDS}s | Reply: {SUMMARY_EXCHANGE}:{DONE_KEY}")
+    print("=== ANALYSIS WORKER READY ===")
 
     while True:
-        # 1) czekaj na start
         desc, td = wait_for_analysis_start(ch)
-        print(f"[START] description='{desc}' totalDepth={td}")
+        print(f"[START] {desc} depth={td}")
 
-        # 2) dopiero teraz konsumuj RAW dla tej sesji
+        drain_raw_queue(ch)
         consume_raw_for_one_session(ch, desc, td)
-
-        # 3) wracamy do czekania na kolejny analysis_start
-        print("[*] Session finished. Waiting for next analysis_start...")
 
 
 if __name__ == "__main__":
